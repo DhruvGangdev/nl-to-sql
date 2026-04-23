@@ -5,7 +5,6 @@ import plotly.express as px
 from groq import Groq
 import os
 import tempfile
-import struct
 
 st.set_page_config(page_title="NL to SQL", page_icon="🔍", layout="wide")
 
@@ -19,7 +18,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Upload your database file",
         type=["db", "sqlite", "sqlite3", "bak"],
-        help="Supports SQLite (.db, .sqlite, .sqlite3) and backup files (.bak)"
+        help="Supports SQLite (.db, .sqlite, .sqlite3) and SQL Server / SAP B1 backup files (.bak)",
     )
     st.markdown("---")
     st.markdown("**Sample questions:**")
@@ -36,130 +35,183 @@ with st.sidebar:
             st.session_state["question"] = s
 
 
-# ── BAK detection helpers ────────────────────────────────────────────────────
+# ── File loading ─────────────────────────────────────────────────────────────
 
-SQLITE_MAGIC = b"SQLite format 3\x00"   # first 16 bytes of every SQLite file
-
-def is_sqlite_file(data: bytes) -> bool:
-    """Return True if the raw bytes look like a SQLite database."""
-    return data[:16] == SQLITE_MAGIC
+SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
-def is_mssql_bak(data: bytes) -> bool:
+def _write_temp(data: bytes, suffix: str) -> str:
+    """Write bytes to a temp file and return the path."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        return tmp.name
+
+
+def _try_sqlite(data: bytes):
+    """Try opening data as a SQLite database. Returns connection or raises."""
+    path = _write_temp(data, ".db")
+    conn = sqlite3.connect(path)
+    # Verify it's a real SQLite db — this will raise if not
+    conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return conn
+
+
+def _try_sqlbak(data: bytes):
+    """Try parsing as SQL Server backup using the `sqlbak` library."""
+    from sqlbak import BakFile  # pip install sqlbak
+
+    path = _write_temp(data, ".bak")
+    bak = BakFile(path)
+    mem = sqlite3.connect(":memory:")
+    for table_name in bak.tables:
+        df = bak.read_table(table_name)
+        df.to_sql(table_name, mem, if_exists="replace", index=False)
+    os.unlink(path)
+    return mem
+
+
+def _try_mssqlreader(data: bytes):
+    """Try parsing as SQL Server backup using the `mssqlreader` library."""
+    from mssqlreader import MSSQLReader  # pip install mssqlreader
+
+    path = _write_temp(data, ".bak")
+    reader = MSSQLReader(path)
+    mem = sqlite3.connect(":memory:")
+    for table_name, df in reader.read_tables():
+        df.to_sql(table_name, mem, if_exists="replace", index=False)
+    os.unlink(path)
+    return mem
+
+
+def _try_pyodbc(data: bytes):
     """
-    SQL Server .bak files start with the Microsoft Tape Format (MTF) header.
-    The first 4 bytes are the DBLK type 'TAPE' (0x54415045) or the string 'MSSQLBAK'.
-    A reliable check: look for the MTF magic bytes at offset 0.
+    Restore SQL Server .bak via pyodbc + local SQL Server / LocalDB.
+    Requires: pip install pyodbc  AND  SQL Server or LocalDB installed.
     """
-    MTF_MAGIC = b"\x54\x41\x50\x45"   # 'TAPE'
-    return data[:4] == MTF_MAGIC
+    import pyodbc  # pip install pyodbc
+
+    bak_path = _write_temp(data, ".bak")
+    drivers = [d for d in pyodbc.drivers() if "SQL Server" in d]
+    if not drivers:
+        raise RuntimeError("No SQL Server ODBC driver found on this machine.")
+
+    conn_str = f"DRIVER={{{drivers[0]}}};SERVER=(localdb)\\MSSQLLocalDB;Trusted_Connection=yes;"
+    sql_conn = pyodbc.connect(conn_str, autocommit=True)
+    cursor = sql_conn.cursor()
+
+    db_name = f"tmpbak_{os.getpid()}"
+    mdf_path = os.path.join(tempfile.gettempdir(), f"{db_name}.mdf")
+
+    # Get logical names from the backup header
+    cursor.execute(f"RESTORE FILELISTONLY FROM DISK = N'{bak_path}'")
+    file_rows = cursor.fetchall()
+    move_clauses = ""
+    for i, row in enumerate(file_rows):
+        logical = row[0]
+        ext = ".mdf" if i == 0 else f"_{i}.ldf"
+        phys = os.path.join(tempfile.gettempdir(), f"{db_name}{ext}")
+        move_clauses += f"MOVE N'{logical}' TO N'{phys}', "
+
+    cursor.execute(
+        f"RESTORE DATABASE [{db_name}] FROM DISK = N'{bak_path}' "
+        f"WITH {move_clauses} REPLACE, RECOVERY"
+    )
+
+    sql_conn2 = pyodbc.connect(conn_str + f"DATABASE={db_name};")
+    mem = sqlite3.connect(":memory:")
+    tables = [
+        r[0]
+        for r in sql_conn2.cursor()
+        .execute(
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'"
+        )
+        .fetchall()
+    ]
+    for t in tables:
+        df = pd.read_sql(f"SELECT * FROM [{t}]", sql_conn2)
+        df.to_sql(t, mem, if_exists="replace", index=False)
+
+    sql_conn2.close()
+    cursor.execute(f"DROP DATABASE [{db_name}]")
+    sql_conn.close()
+    os.unlink(bak_path)
+    return mem
 
 
 def load_connection(uploaded_file):
     """
-    Accept any supported file, return (sqlite3.Connection, file_type_label).
-    Handles:
-      - .db / .sqlite / .sqlite3  → open directly
-      - .bak that IS a SQLite file → open directly
-      - .bak that IS a SQL Server backup → parse with mssql-to-sqlite conversion
+    Auto-detect file type and return (sqlite3.Connection, label).
+
+    Detection order
+    ---------------
+    1. SQLite magic bytes  → open directly
+    2. .bak → try sqlbak        (pure-Python, no SQL Server needed)
+    3. .bak → try mssqlreader   (pure-Python, no SQL Server needed)
+    4. .bak → try pyodbc        (needs local SQL Server / LocalDB)
+    5. .bak → SQLite fallback   (in case it's just a renamed .db)
+    6. All failed → friendly error with install instructions
     """
     raw = uploaded_file.read()
     fname = uploaded_file.name.lower()
+    errors = []
 
-    # ── Case 1: plain SQLite (any extension) ──────────────────────────────
-    if is_sqlite_file(raw):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        conn = sqlite3.connect(tmp_path)
-        return conn, "SQLite"
-
-    # ── Case 2: SQL Server .bak ───────────────────────────────────────────
-    if fname.endswith(".bak") and is_mssql_bak(raw):
-        return _load_mssql_bak(raw)
-
-    # ── Case 3: .bak that is neither SQLite nor MTF — try SQLite anyway ──
-    #    (some tools just rename .db to .bak)
-    if fname.endswith(".bak"):
+    # ── 1. SQLite magic bytes check (100% reliable) ───────────────────────
+    if raw[:16] == SQLITE_MAGIC:
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-                tmp.write(raw)
-                tmp_path = tmp.name
-            conn = sqlite3.connect(tmp_path)
-            # Quick sanity check — will raise if not a valid SQLite db
-            conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            return conn, "SQLite (.bak renamed)"
-        except Exception:
-            pass  # fall through to error below
+            return _try_sqlite(raw), "SQLite"
+        except Exception as e:
+            errors.append(f"SQLite open failed: {e}")
 
+    # ── 2–5. .bak strategies — NO magic-byte gate (handles all versions) ──
+    if fname.endswith(".bak"):
+
+        # Strategy 2: sqlbak (pure-Python)
+        try:
+            return _try_sqlbak(raw), "SQL Server .bak → sqlbak"
+        except ImportError:
+            errors.append("sqlbak not installed  →  pip install sqlbak")
+        except Exception as e:
+            errors.append(f"sqlbak: {e}")
+
+        # Strategy 3: mssqlreader (pure-Python)
+        try:
+            return _try_mssqlreader(raw), "SQL Server .bak → mssqlreader"
+        except ImportError:
+            errors.append("mssqlreader not installed  →  pip install mssqlreader")
+        except Exception as e:
+            errors.append(f"mssqlreader: {e}")
+
+        # Strategy 4: pyodbc + local SQL Server
+        try:
+            return _try_pyodbc(raw), "SQL Server .bak → pyodbc"
+        except ImportError:
+            errors.append("pyodbc not installed  →  pip install pyodbc")
+        except Exception as e:
+            errors.append(f"pyodbc: {e}")
+
+        # Strategy 5: last-ditch SQLite fallback
+        try:
+            return _try_sqlite(raw), "SQLite (.bak renamed)"
+        except Exception as e:
+            errors.append(f"SQLite fallback: {e}")
+
+        # All strategies exhausted
+        detail = "\n".join(f"  • {e}" for e in errors)
+        raise RuntimeError(
+            f"❌ Could not open **{uploaded_file.name}**.\n\n"
+            "**Attempts made:**\n"
+            f"{detail}\n\n"
+            "**Quick fix — install a pure-Python parser (no SQL Server needed):**\n"
+            "```bash\npip install sqlbak\n```\n"
+            "or\n"
+            "```bash\npip install mssqlreader\n```\n"
+            "Then restart the app and re-upload the file."
+        )
+
+    # Non-.bak, non-SQLite
     raise ValueError(
-        f"Unsupported file format for '{uploaded_file.name}'.\n"
-        "Accepted formats: SQLite (.db, .sqlite, .sqlite3) or SQL Server backup (.bak)."
-    )
-
-
-def _load_mssql_bak(raw: bytes):
-    """
-    Convert a SQL Server .bak to an in-memory SQLite database.
-
-    Strategy
-    --------
-    We use the `mssql-bak-reader` / `sqlbak` pure-Python library when available.
-    If it isn't installed we fall back to a helpful error message that tells the
-    user exactly what to install — rather than a cryptic crash.
-    """
-    # ── Try sqlbak (pip install sqlbak) ───────────────────────────────────
-    try:
-        import sqlbak  # noqa: F401 – imported for side-effects / availability check
-        from sqlbak import BakFile
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bak") as tmp:
-            tmp.write(raw)
-            bak_path = tmp.name
-
-        bak = BakFile(bak_path)
-
-        # Build in-memory SQLite from every table in the backup
-        mem_conn = sqlite3.connect(":memory:")
-
-        for table_name in bak.tables:
-            df = bak.read_table(table_name)
-            df.to_sql(table_name, mem_conn, if_exists="replace", index=False)
-
-        os.unlink(bak_path)
-        return mem_conn, "SQL Server .bak (via sqlbak)"
-
-    except ImportError:
-        pass  # library not installed — try next method
-
-    # ── Try mssqlreader (pip install mssqlreader) ─────────────────────────
-    try:
-        from mssqlreader import MSSQLReader  # noqa: F401
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bak") as tmp:
-            tmp.write(raw)
-            bak_path = tmp.name
-
-        reader = MSSQLReader(bak_path)
-        mem_conn = sqlite3.connect(":memory:")
-
-        for table_name, df in reader.read_tables():
-            df.to_sql(table_name, mem_conn, if_exists="replace", index=False)
-
-        os.unlink(bak_path)
-        return mem_conn, "SQL Server .bak (via mssqlreader)"
-
-    except ImportError:
-        pass
-
-    # ── No library available — friendly instructions ──────────────────────
-    raise RuntimeError(
-        "A SQL Server .bak file was detected, but no parser library is installed.\n\n"
-        "Install one of the following and restart the app:\n"
-        "  pip install sqlbak\n"
-        "  pip install mssqlreader\n\n"
-        "Alternatively, restore the .bak in SQL Server Management Studio and "
-        "export the tables as CSV, then re-upload."
+        f"Unsupported file: **{uploaded_file.name}**\n"
+        "Accepted formats: `.db`, `.sqlite`, `.sqlite3`, `.bak`"
     )
 
 
@@ -171,7 +223,7 @@ def get_schema(conn):
     tables = [r[0] for r in cur.fetchall()]
     schema = ""
     for t in tables:
-        cur.execute(f"PRAGMA table_info({t})")
+        cur.execute(f"PRAGMA table_info('{t}')")
         cols = cur.fetchall()
         col_str = ", ".join([f"{c[1]} {c[2]}" for c in cols])
         cur.execute(f"SELECT COUNT(*) FROM '{t}'")
@@ -265,7 +317,7 @@ elif not uploaded_file:
 else:
     try:
         conn, file_type = load_connection(uploaded_file)
-        st.sidebar.success(f"Loaded as: **{file_type}**")
+        st.sidebar.success(f"✅ Loaded as: **{file_type}**")
     except (ValueError, RuntimeError) as e:
         st.error(str(e))
         st.stop()
