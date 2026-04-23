@@ -14,7 +14,7 @@ st.caption("Ask questions in plain English — get SQL + results + charts")
 # Sidebar
 with st.sidebar:
     st.header("Setup")
-    api_key = st.text_input("Groq API Key", type="password", placeholder="gsk_...")
+    api_key = st.text_input("Groq API Key", type="password", placeholder="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")
     uploaded_file = st.file_uploader("Upload your .db file", type=["db", "sqlite", "sqlite3"])
     st.markdown("---")
     st.markdown("**Sample questions:**")
