@@ -18,7 +18,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Upload your database file",
         type=["db", "sqlite", "sqlite3", "bak"],
-        help="Supports SQLite (.db, .sqlite, .sqlite3) and SQL Server / SAP B1 backup files (.bak)",
+        help="Supports SQLite (.db, .sqlite, .sqlite3) and SQL Server / SAP B1 backup files (.bak) — up to 5 GB",
     )
     st.markdown("---")
     st.markdown("**Sample questions:**")
@@ -51,14 +51,13 @@ def _try_sqlite(data: bytes):
     """Try opening data as a SQLite database. Returns connection or raises."""
     path = _write_temp(data, ".db")
     conn = sqlite3.connect(path)
-    # Verify it's a real SQLite db — this will raise if not
     conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     return conn
 
 
 def _try_sqlbak(data: bytes):
     """Try parsing as SQL Server backup using the `sqlbak` library."""
-    from sqlbak import BakFile  # pip install sqlbak
+    from sqlbak import BakFile
 
     path = _write_temp(data, ".bak")
     bak = BakFile(path)
@@ -72,7 +71,7 @@ def _try_sqlbak(data: bytes):
 
 def _try_mssqlreader(data: bytes):
     """Try parsing as SQL Server backup using the `mssqlreader` library."""
-    from mssqlreader import MSSQLReader  # pip install mssqlreader
+    from mssqlreader import MSSQLReader
 
     path = _write_temp(data, ".bak")
     reader = MSSQLReader(path)
@@ -84,11 +83,8 @@ def _try_mssqlreader(data: bytes):
 
 
 def _try_pyodbc(data: bytes):
-    """
-    Restore SQL Server .bak via pyodbc + local SQL Server / LocalDB.
-    Requires: pip install pyodbc  AND  SQL Server or LocalDB installed.
-    """
-    import pyodbc  # pip install pyodbc
+    """Restore SQL Server .bak via pyodbc + local SQL Server / LocalDB."""
+    import pyodbc
 
     bak_path = _write_temp(data, ".bak")
     drivers = [d for d in pyodbc.drivers() if "SQL Server" in d]
@@ -100,9 +96,7 @@ def _try_pyodbc(data: bytes):
     cursor = sql_conn.cursor()
 
     db_name = f"tmpbak_{os.getpid()}"
-    mdf_path = os.path.join(tempfile.gettempdir(), f"{db_name}.mdf")
 
-    # Get logical names from the backup header
     cursor.execute(f"RESTORE FILELISTONLY FROM DISK = N'{bak_path}'")
     file_rows = cursor.fetchall()
     move_clauses = ""
@@ -155,17 +149,16 @@ def load_connection(uploaded_file):
     fname = uploaded_file.name.lower()
     errors = []
 
-    # ── 1. SQLite magic bytes check (100% reliable) ───────────────────────
+    # ── 1. SQLite magic bytes check ───────────────────────────────────────
     if raw[:16] == SQLITE_MAGIC:
         try:
             return _try_sqlite(raw), "SQLite"
         except Exception as e:
             errors.append(f"SQLite open failed: {e}")
 
-    # ── 2–5. .bak strategies — NO magic-byte gate (handles all versions) ──
+    # ── 2–5. .bak strategies ──────────────────────────────────────────────
     if fname.endswith(".bak"):
 
-        # Strategy 2: sqlbak (pure-Python)
         try:
             return _try_sqlbak(raw), "SQL Server .bak → sqlbak"
         except ImportError:
@@ -173,7 +166,6 @@ def load_connection(uploaded_file):
         except Exception as e:
             errors.append(f"sqlbak: {e}")
 
-        # Strategy 3: mssqlreader (pure-Python)
         try:
             return _try_mssqlreader(raw), "SQL Server .bak → mssqlreader"
         except ImportError:
@@ -181,7 +173,6 @@ def load_connection(uploaded_file):
         except Exception as e:
             errors.append(f"mssqlreader: {e}")
 
-        # Strategy 4: pyodbc + local SQL Server
         try:
             return _try_pyodbc(raw), "SQL Server .bak → pyodbc"
         except ImportError:
@@ -189,13 +180,11 @@ def load_connection(uploaded_file):
         except Exception as e:
             errors.append(f"pyodbc: {e}")
 
-        # Strategy 5: last-ditch SQLite fallback
         try:
             return _try_sqlite(raw), "SQLite (.bak renamed)"
         except Exception as e:
             errors.append(f"SQLite fallback: {e}")
 
-        # All strategies exhausted
         detail = "\n".join(f"  • {e}" for e in errors)
         raise RuntimeError(
             f"❌ Could not open **{uploaded_file.name}**.\n\n"
@@ -208,7 +197,6 @@ def load_connection(uploaded_file):
             "Then restart the app and re-upload the file."
         )
 
-    # Non-.bak, non-SQLite
     raise ValueError(
         f"Unsupported file: **{uploaded_file.name}**\n"
         "Accepted formats: `.db`, `.sqlite`, `.sqlite3`, `.bak`"
